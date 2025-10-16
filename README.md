@@ -2,6 +2,11 @@
 
 A Python script that generates SVG code from text prompts using machine learning models.
 
+## Introduction
+
+> **Warning**
+> This is an experimental project to run a local model.  Execution can be slow, and the generated SVG may not always be accurate.
+
 ## Prerequisites
 
 - macOS (tested on macOS 14+)
