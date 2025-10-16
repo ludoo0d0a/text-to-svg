@@ -11,6 +11,13 @@ import torch
 from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+# --- Model Configuration ---
+# List of supported direct-access models from Hugging Face Hub, in order of preference.
+SUPPORTED_DIRECT_MODELS = [
+    "mohannad-tazi/Llama-3.1-8B-Instruct-text-to-svg",
+    "vinoku89/svg-code-generator",
+]
+
 class TextToSVGGenerator:
     def __init__(self):
         self.project_dir = Path(__file__).parent
@@ -26,10 +33,10 @@ class TextToSVGGenerator:
         adapter_files = list(self.models_dir.glob("adapter_*.json"))
         
         if base_model_path.exists() and adapter_files:
-            available_models["llama"] = {
+            available_models["llama_lora"] = {
                 "type": "llama_lora",
                 "base_path": base_model_path,
-                "adapter_path": self.models_dir
+                "adapter_path": self.models_dir,
             }
         
         # Check for public model
@@ -41,16 +48,14 @@ class TextToSVGGenerator:
             }
         
         # Check for direct model access (mohannad-tazi)
-        try:
-            from huggingface_hub import repo_info
-            repo_info("mohannad-tazi/Llama-3.1-8B-Instruct-text-to-svg")
-            available_models["mohannad"] = {
-                "type": "direct",
-                "name": "mohannad-tazi/Llama-3.1-8B-Instruct-text-to-svg"
-            }
-        except:
-            pass
-        
+        from huggingface_hub import repo_info
+        for model_name in SUPPORTED_DIRECT_MODELS:
+            try:
+                repo_info(model_name)
+                available_models[model_name] = {"type": "local", "name": model_name}
+            except Exception:
+                # Model not accessible, skip it
+                pass
         return available_models
     
     def generate_with_llama_lora(self, prompt):
@@ -128,13 +133,12 @@ class TextToSVGGenerator:
             print(f"❌ Error with public model: {e}")
             return None
     
-    def generate_with_direct_model(self, prompt):
-        """Generate using direct model access (mohannad-tazi)"""
+    def generate_with_direct_model(self, prompt, model_name):
+        """Generate using a direct-access model from Hugging Face Hub"""
         try:
-            print("🔄 Loading mohannad-tazi model...")
+            print(f"🔄 Loading direct-access model: {model_name}...")
             
-            model_name = "mohannad-tazi/Llama-3.1-8B-Instruct-text-to-svg"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+            tokenizer = AutoTokenizer.from_pretrained(model_name)
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 dtype=torch.float32,
@@ -184,19 +188,21 @@ class TextToSVGGenerator:
         print(f"📋 Available models: {list(available_models.keys())}")
         
         # Try models in order of preference
-        model_order = ["mohannad", "llama", "public"]
+        # Local models first, then direct-access models from the constant list
+        model_order = ["llama_lora", "public"] + SUPPORTED_DIRECT_MODELS
         
         for model_key in model_order:
             if model_key in available_models:
                 model_info = available_models[model_key]
                 print(f"\n🔄 Trying {model_key} model...")
                 
+                result = None
                 if model_info["type"] == "llama_lora":
                     result = self.generate_with_llama_lora(prompt)
                 elif model_info["type"] == "public":
                     result = self.generate_with_public_model(prompt)
-                elif model_info["type"] == "direct":
-                    result = self.generate_with_direct_model(prompt)
+                elif model_info["type"] == "local":
+                    result = self.generate_with_direct_model(prompt, model_name=model_info["name"])
                 else:
                     continue
                 
