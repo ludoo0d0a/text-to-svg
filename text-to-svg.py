@@ -18,8 +18,9 @@ from huggingface_hub.utils import HfHubHTTPError
 # List of supported direct-access models from Hugging Face Hub, in order of preference.
 SUPPORTED_DIRECT_MODELS = [
     "mohannad-tazi/Llama-3.1-8B-Instruct-text-to-svg",
-    "vinoku89/svg-code-generator",
+    "vinoku89/svg-code-generator"
 ]
+DEFAULT_MODEL = "vinoku89/svg-code-generator"
 # List of supported GGUF models.
 SUPPORTED_GGUF_MODELS = {
     "mradermacher/svg-code-generator-GGUF": "svg-code-generator-L3-8B-Instruct-Q4_K_M.gguf"
@@ -363,7 +364,7 @@ class TextToSVGGenerator:
         target_model_key = model_name
         if target_model_key is None:
             # Default to vinoku89 if no model is specified
-            target_model_key = "vinoku89/svg-code-generator"
+            target_model_key = DEFAULT_MODEL
             print(f"💡 No model specified, using default: {target_model_key}")
 
         if target_model_key not in available_models:
@@ -468,6 +469,14 @@ def main():
                 print("-" * 30)
                 print(svg_content)
                 print("-" * 30)
+
+                # Save the extracted SVG to a file
+                output_path = generator.project_dir / "outputs" / "output.svg"
+                try:
+                    output_path.write_text(svg_content, encoding="utf-8")
+                    print(f"✅ SVG saved to: {output_path}")
+                except Exception as e:
+                    print(f"❌ Could not save SVG file: {e}")
     else:
         print("\n❌ Generation failed. Check the error messages above.")
         print("💡 Try running: python setup.py")
