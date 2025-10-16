@@ -60,7 +60,8 @@ pip install peft  # For LoRA adapters
 
 ### 6. Download Models and Setup
 
-**Option A: Complete setup (Recommended)**
+The setup script will check your environment and guide you on authenticating with Hugging Face if needed.
+
 ```bash
 python setup.py
 ```

@@ -9,7 +9,10 @@ import os
 import sys
 import torch
 from pathlib import Path
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from huggingface_hub import snapshot_download, hf_hub_download, whoami
+from huggingface_hub.utils import HfHubHTTPError
 
 # --- Model Configuration ---
 # List of supported direct-access models from Hugging Face Hub, in order of preference.
@@ -17,6 +20,11 @@ SUPPORTED_DIRECT_MODELS = [
     "mohannad-tazi/Llama-3.1-8B-Instruct-text-to-svg",
     "vinoku89/svg-code-generator",
 ]
+# List of supported GGUF models.
+SUPPORTED_GGUF_MODELS = {
+    "mradermacher/svg-code-generator-GGUF": "svg-code-generator-L3-8B-Instruct-Q4_K_M.gguf"
+}
+
 
 class TextToSVGGenerator:
     def __init__(self):
@@ -56,6 +64,15 @@ class TextToSVGGenerator:
             except Exception:
                 # Model not accessible, skip it
                 pass
+
+        # Check for local GGUF models
+        for model_repo, filename in SUPPORTED_GGUF_MODELS.items():
+            gguf_path = self.models_dir / filename
+            if gguf_path.exists():
+                available_models[model_repo] = {
+                    "type": "gguf",
+                    "path": gguf_path
+                }
         return available_models
     
     def generate_with_llama_lora(self, prompt):
@@ -70,8 +87,9 @@ class TextToSVGGenerator:
             tokenizer = AutoTokenizer.from_pretrained(base_model_path)
             base_model = AutoModelForCausalLM.from_pretrained(
                 base_model_path,
-                dtype=torch.float16,
-                device_map="auto"
+                # Use bfloat16 for better memory efficiency and numerical stability
+                dtype=torch.bfloat16,
+                device_map="cpu" # Explicitly load on CPU to avoid device memory issues
             )
             
             # Load LoRA adapter
@@ -137,11 +155,13 @@ class TextToSVGGenerator:
         """Generate using a direct-access model from Hugging Face Hub"""
         try:
             print(f"🔄 Loading direct-access model: {model_name}...")
+            print("💡 This is a large model and may take several minutes to load.")
             
             tokenizer = AutoTokenizer.from_pretrained(model_name)
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                dtype=torch.float32,
+                # Use bfloat16 for better memory efficiency on modern hardware
+                dtype=torch.bfloat16,
                 device_map="cpu"
             )
             
@@ -152,14 +172,17 @@ class TextToSVGGenerator:
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
             
             with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=200,
-                    do_sample=True,
-                    top_p=0.95,
-                    temperature=0.7,
-                    pad_token_id=tokenizer.eos_token_id
-                )
+                with tqdm(total=200, desc="Generating SVG") as pbar:
+                    outputs = model.generate(
+                        **inputs,
+                        max_length=200,
+                        do_sample=True,
+                        top_p=0.95,
+                        temperature=0.7,
+                        pad_token_id=tokenizer.eos_token_id
+                        # The progress bar update is a simple way to show activity - REMOVED
+                    )
+                    pbar.update(200) # Mark as complete
             
             result = tokenizer.decode(outputs[0], skip_special_tokens=True)
             return result
@@ -167,8 +190,157 @@ class TextToSVGGenerator:
         except Exception as e:
             print(f"❌ Error with direct model: {e}")
             return None
+
+    def generate_with_gguf_model(self, prompt, model_path):
+        """Generate using a GGUF model with llama-cpp-python"""
+        try:
+            from llama_cpp import Llama
+
+            print(f"🔄 Loading GGUF model: {model_path.name}...")
+            
+            # Load the GGUF model
+            llm = Llama(
+                model_path=str(model_path),
+                n_ctx=512,  # Context window
+                n_gpu_layers=-1, # Offload all layers to GPU if available
+                verbose=False
+            )
+
+            # Create the prompt for the model
+            full_prompt = f"USER: {prompt}\nASSISTANT:"
+
+            print("🤖 Generating SVG with GGUF model...")
+            output = llm(
+                full_prompt,
+                max_tokens=256,
+                stop=["USER:", "\n"],
+                temperature=0.7,
+                echo=False # Don't echo the prompt in the output
+            )
+            
+            result = output['choices'][0]['text'].strip()
+            return result
+
+        except ImportError:
+            print("❌ GGUF model requires 'llama-cpp-python'. Please install it.")
+            return None
+        except Exception as e:
+            print(f"❌ Error with GGUF model: {e}")
+            return None
+
+    def download_model(self, model_key):
+        """Downloads the specified model if it's known."""
+        print(f"💡 Model '{model_key}' not found locally.")
+        response = input(f"❓ Would you like to download it now? (y/N): ").strip().lower()
+        if response not in ['y', 'yes']:
+            print("⏭️  Skipping download.")
+            return False
+
+        if model_key == "llama_lora":
+            # Requires both base model and adapter
+            print("\n--- Llama + LoRA Setup ---")
+            # Check auth first
+            try:
+                whoami()
+                print("✅ Authenticated with Hugging Face.")
+                base_success = self._download_llama_base_model()
+                adapter_success = self._download_lora_adapter()
+                return base_success and adapter_success
+            except Exception:
+                print("❌ Authentication with Hugging Face is required for the Llama base model.")
+                print("💡 Please run 'huggingface-cli login' and try again.")
+                return False
+        elif model_key in SUPPORTED_GGUF_MODELS:
+            return self._download_gguf_model(model_key)
+        elif model_key == "public":
+            # For simplicity, we'll download a default public model (gpt2)
+            return self._download_public_model()
+        else:
+            print(f"❌ Download logic for model '{model_key}' is not implemented.")
+            return False
+
+    def _download_llama_base_model(self):
+        """Download the Llama base model"""
+        try:
+            print("\n🦙 Downloading Llama-3.2-3B-Instruct base model...")
+            base_model_dir = self.models_dir / "base_model"
+            base_model_dir.mkdir(parents=True, exist_ok=True)
+            
+            snapshot_download(
+                repo_id="meta-llama/Llama-3.2-3B-Instruct",
+                local_dir=base_model_dir,
+                local_dir_use_symlinks=False
+            )
+            print("✅ Llama base model downloaded successfully.")
+            return True
+        except HfHubHTTPError as e:
+            if "401" in str(e) or "403" in str(e):
+                print("🔐 Authentication required for Llama model.")
+                print("💡 You may need to request access at: https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct")
+            else:
+                print(f"❌ HTTP Error downloading Llama model: {e}")
+            return False
+        except Exception as e:
+            print(f"❌ Unexpected error during Llama download: {e}")
+            return False
+
+    def _download_lora_adapter(self):
+        """Download the LoRA adapter"""
+        try:
+            print("\n🔧 Downloading LoRA adapter...")
+            snapshot_download(
+                repo_id="mohannad-tazi/Llama-3.1-8B-Instruct-text-to-svg",
+                local_dir=self.models_dir,
+                local_dir_use_symlinks=False
+            )
+            print("✅ LoRA adapter downloaded successfully.")
+            return True
+        except Exception as e:
+            print(f"❌ Error downloading adapter: {e}")
+            return False
+
+    def _download_gguf_model(self, model_key):
+        """Download a GGUF model"""
+        try:
+            print(f"\n🧠 Downloading GGUF model: {model_key}...")
+            repo_id = model_key
+            filename = SUPPORTED_GGUF_MODELS[model_key]
+            
+            self.models_dir.mkdir(parents=True, exist_ok=True)
+            
+            hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir=self.models_dir,
+            )
+            print(f"✅ GGUF model downloaded successfully.")
+            return True
+        except Exception as e:
+            print(f"❌ Error downloading GGUF model: {e}")
+            return False
+
+    def _download_public_model(self):
+        """Download a default public model (gpt2)"""
+        try:
+            model_repo = "gpt2"
+            print(f"\n📥 Downloading public model: {model_repo}...")
+            public_model_dir = self.models_dir / "public_model"
+            public_model_dir.mkdir(parents=True, exist_ok=True)
+            
+            snapshot_download(
+                repo_id=model_repo,
+                local_dir=public_model_dir,
+                local_dir_use_symlinks=False
+            )
+            
+            print(f"✅ Public model '{model_repo}' downloaded successfully.")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error downloading public model: {e}")
+            return False
     
-    def generate_svg(self, prompt=None):
+    def generate_svg(self, prompt=None, model_name=None):
         """Generate SVG from text prompt using the best available model"""
         
         if prompt is None:
@@ -187,65 +359,97 @@ class TextToSVGGenerator:
         
         print(f"📋 Available models: {list(available_models.keys())}")
         
-        # Try models in order of preference
-        # Local models first, then direct-access models from the constant list
-        model_order = ["llama_lora", "public"] + SUPPORTED_DIRECT_MODELS
+        # Determine which model to use
+        target_model_key = model_name
+        if target_model_key is None:
+            # Default to vinoku89 if no model is specified
+            target_model_key = "vinoku89/svg-code-generator"
+            print(f"💡 No model specified, using default: {target_model_key}")
+
+        if target_model_key not in available_models:
+            print(f"❌ Specified model '{target_model_key}' is not available.")
+            print(f"💡 Please choose from: {list(available_models.keys())}")
+            return None
+
+        # Use the selected model
+        model_info = available_models[target_model_key]
+        print(f"\n🔄 Using model: {target_model_key}")
         
-        for model_key in model_order:
-            if model_key in available_models:
-                model_info = available_models[model_key]
-                print(f"\n🔄 Trying {model_key} model...")
-                
-                result = None
-                if model_info["type"] == "llama_lora":
-                    result = self.generate_with_llama_lora(prompt)
-                elif model_info["type"] == "public":
-                    result = self.generate_with_public_model(prompt)
-                elif model_info["type"] == "local":
-                    result = self.generate_with_direct_model(prompt, model_name=model_info["name"])
-                else:
-                    continue
-                
-                if result:
-                    print(f"✅ Generated using {model_key} model")
-                    return result
+        result = None
+        if model_info["type"] == "llama_lora":
+            result = self.generate_with_llama_lora(prompt)
+        elif model_info["type"] == "public":
+            result = self.generate_with_public_model(prompt)
+        elif model_info["type"] == "local":
+            result = self.generate_with_direct_model(prompt, model_name=model_info["name"])
+        elif model_info["type"] == "gguf":
+            result = self.generate_with_gguf_model(prompt, model_path=model_info["path"])
         
-        print("❌ All models failed to generate output")
-        return None
+        if result:
+            print(f"✅ Generated using {target_model_key} model")
+            return result
+        else:
+            print(f"❌ Model {target_model_key} failed to generate output.")
+            return None
     
-    def print_help(self):
-        """Print usage information"""
+def print_help(self):
         print("🎨 Text-to-SVG Generator")
         print("=" * 30)
         print()
         print("Usage:")
-        print("  python text-to-svg.py                    # Use default prompt")
-        print("  python text-to-svg.py 'your prompt'      # Use custom prompt")
-        print("  python text-to-svg.py --help             # Show this help")
+        print("  python text-to-svg.py [options] ['your prompt']")
+        print()
+        print("Options:")
+        print("  --model <model_name>   Specify which model to use (e.g., 'llama_lora').")
+        print("  --help, -h             Show this help message.")
+        print()
+        print("Examples:")
+        print("  python text-to-svg.py                                  # Use default prompt and model")
+        print("  python text-to-svg.py 'a blue square'                  # Use custom prompt and default model")
+        print("  python text-to-svg.py --model llama_lora 'a red star'  # Use a specific model")
         print()
         print("Default prompt:", self.default_prompt)
+        print("Default model:", "vinoku89/svg-code-generator")
         print()
         print("Available models will be detected automatically.")
-        print("Run 'python setup.py --auto' to download models if none are found.")
+        print("Run 'python setup.py' to download models if none are found.")
 
 def main():
-    """Main function"""
+    """Main function with argument parsing"""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Unified Text-to-SVG Generator",
+        add_help=False # We use a custom help message
+    )
+    parser.add_argument(
+        'prompt', 
+        nargs='*', 
+        help="The text prompt for SVG generation."
+    )
+    parser.add_argument(
+        '--model', 
+        type=str, 
+        default=None, 
+        help="Specify the model to use."
+    )
+    parser.add_argument(
+        '--help', '-h', 
+        action='store_true', 
+        help="Show help message."
+    )
+    
+    args = parser.parse_args()
     generator = TextToSVGGenerator()
     
-    # Handle command line arguments
-    if len(sys.argv) > 1:
-        if sys.argv[1] in ["--help", "-h", "help"]:
-            generator.print_help()
-            return
-        
-        # Use provided prompt
-        prompt = " ".join(sys.argv[1:])
-    else:
-        # Use default prompt
-        prompt = None
+    if args.help:
+        generator.print_help()
+        return
+
+    # Join prompt arguments into a single string
+    prompt_text = " ".join(args.prompt) if args.prompt else None
     
     # Generate SVG
-    result = generator.generate_svg(prompt)
+    result = generator.generate_svg(prompt=prompt_text, model_name=args.model)
     
     if result:
         print("\n" + "=" * 60)
@@ -266,7 +470,7 @@ def main():
                 print("-" * 30)
     else:
         print("\n❌ Generation failed. Check the error messages above.")
-        print("💡 Try running: python setup.py --auto")
+        print("💡 Try running: python setup.py")
 
 if __name__ == "__main__":
     main()
